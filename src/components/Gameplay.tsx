@@ -28,6 +28,7 @@ import {
   Maximize2,
   Trash2,
   RotateCcw,
+  Activity,
 } from "lucide-react";
 import { useStore } from "../store/useStore";
 import { useDeviceMode } from "../hooks/useDeviceMode";
@@ -169,6 +170,7 @@ export default function Gameplay() {
   const [showSettings, setShowSettings] = useState(false);
   const [showMC, setShowMC] = useState(false);
   const [showRules, setShowRules] = useState(false);
+  const [showStatus, setShowStatus] = useState(false);
   const [selectedNPCIndex, setSelectedNPCIndex] = useState<number | null>(null);
 
   // Stats & Timers
@@ -253,21 +255,18 @@ export default function Gameplay() {
   const [currentPage, setCurrentPage] = useState(1);
   const [editingTurnId, setEditingTurnId] = useState<string | null>(null);
   const [editingContent, setEditingContent] = useState<string>("");
-  const totalPages =
-    turns.length <= 11 ? 1 : 1 + Math.ceil((turns.length - 11) / 10);
+  const totalPages = Math.max(1, turns.length);
 
   useEffect(() => {
-    const desiredPage =
-      turns.length <= 11 ? 1 : 1 + Math.ceil((turns.length - 11) / 10);
-    setCurrentPage(desiredPage || 1);
+    setCurrentPage(Math.max(1, turns.length));
   }, [turns.length]);
 
   const getPageTurns = (page: number) => {
-    if (page === 1)
-      return turns.filter((t: any) => t.index >= 0 && t.index <= 10);
-    const start = 10 * page - 9;
-    const end = 10 * page;
-    return turns.filter((t: any) => t.index >= start && t.index <= end);
+    const idx = page - 1;
+    if (idx >= 0 && idx < turns.length) {
+      return [turns[idx]];
+    }
+    return [];
   };
 
   // Modals
@@ -1016,6 +1015,12 @@ Hành động tiếp theo của người chơi: ${userAction}`;
               <ListTodo size={14} /> <span>RULES</span>
             </button>
             <button
+              onClick={() => setShowStatus(true)}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-teal-500/20 text-teal-400 hover:bg-teal-500/30 transition-colors cursor-pointer text-xs font-bold tracking-wider"
+            >
+              <Activity size={14} /> <span>STATUS</span>
+            </button>
+            <button
               onClick={() => setShowGallery(true)}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-pink-500/20 text-pink-400 hover:bg-pink-500/30 transition-colors cursor-pointer text-xs font-bold tracking-wider"
             >
@@ -1564,6 +1569,12 @@ Hành động tiếp theo của người chơi: ${userAction}`;
                     <ListTodo size={16} /> <span>RULES</span>
                   </button>
                   <button
+                    onClick={() => setShowStatus(true)}
+                    className="flex flex-col items-center justify-center gap-1.5 p-2 rounded-lg bg-teal-500/10 text-teal-400 hover:bg-teal-500/20 transition-colors cursor-pointer text-[10px] font-bold tracking-wider"
+                  >
+                    <Activity size={16} /> <span>STATUS</span>
+                  </button>
+                  <button
                     onClick={() => setShowGallery(true)}
                     className="flex flex-col items-center justify-center gap-1.5 p-2 rounded-lg bg-pink-500/10 text-pink-400 hover:bg-pink-500/20 transition-colors cursor-pointer text-[10px] font-bold tracking-wider"
                   >
@@ -1734,16 +1745,20 @@ Hành động tiếp theo của người chơi: ${userAction}`;
           />
         )}
 
+        {showStatus && (
+          <StatusModal onClose={() => setShowStatus(false)} />
+        )}
+
         {showRules && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="absolute inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4"
+            className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex flex-col w-screen h-screen p-0 m-0 overflow-hidden"
             onClick={() => setShowRules(false)}
           >
             <div 
-              className="bg-[#0a0a0a] border border-white/10 rounded-2xl w-full max-w-4xl max-h-[90vh] flex flex-col shadow-2xl"
+              className="bg-[#0a0a0a] w-full h-full flex flex-col rounded-none border-0 shadow-none overflow-hidden"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="p-4 border-b border-white/10 flex items-center justify-between shrink-0">
@@ -1780,11 +1795,11 @@ Hành động tiếp theo của người chơi: ${userAction}`;
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="absolute inset-0 z-50 bg-black/80 backdrop-blur-xl flex items-center justify-center p-4 md:p-6"
+            className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xl flex flex-col w-screen h-screen p-0 m-0 overflow-hidden"
             onClick={() => setShowMemory(false)}
           >
             <div 
-              className="w-full h-full max-w-7xl flex flex-col bg-[#050505] rounded-3xl border border-white/10 overflow-hidden shadow-2xl"
+              className="w-full h-full flex flex-col bg-[#050505] rounded-none border-0 overflow-hidden shadow-none"
               onClick={(e) => e.stopPropagation()}
             >
               {/* Header */}
@@ -2117,11 +2132,11 @@ Hành động tiếp theo của người chơi: ${userAction}`;
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="absolute inset-0 z-50 bg-black/80 backdrop-blur-xl flex items-center justify-center p-4 md:p-6"
+            className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xl flex flex-col w-screen h-screen p-0 m-0 overflow-hidden"
             onClick={() => setShowSettings(false)}
           >
             <div 
-              className="w-full max-w-7xl mx-auto h-full flex flex-col bg-[#050505] border border-white/10 rounded-3xl overflow-hidden shadow-2xl"
+              className="w-full h-full flex flex-col bg-[#050505] border-0 rounded-none overflow-hidden shadow-none"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="p-4 md:p-6 border-b border-white/10 flex flex-wrap items-center justify-between gap-4 shrink-0 bg-black/40">
