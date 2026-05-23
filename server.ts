@@ -95,12 +95,7 @@ async function startServer() {
       res.json({ 
         data: [
           { id: "gemini-3.1-pro-preview" }, 
-          { id: "gemini-3.5-flash" }, 
-          { id: "gemini-3.1-flash-lite" }, 
-          { id: "gemini-2.5-flash" }, 
-          { id: "gemini-2.0-flash" }, 
-          { id: "gemini-1.5-pro" }, 
-          { id: "gemini-1.5-flash" }
+          { id: "gemini-3.5-flash" }
         ] 
       });
     }
@@ -166,6 +161,13 @@ async function startServer() {
       res.setHeader("X-Accel-Buffering", "no");
       res.flushHeaders();
 
+      // PING CƠ CHẾ GIỮ KẾT NỐI KHÔNG BỊ TIMEOUT
+      const pingInterval = setInterval(() => {
+        res.write(":\n\n");
+      }, 10000);
+      
+      req.on('close', () => clearInterval(pingInterval));
+
       const sysInstruction = systemInstruction || "";
 
 
@@ -195,6 +197,9 @@ async function startServer() {
   });
 
   async function handleProxyGeneration(req: any, res: any, activeProxy: any, model: string, prompt: string, schema: any, sysInstruction: string, temperature: number) {
+        let isClientDisconnected = false;
+        req.on('close', () => { isClientDisconnected = true; });
+
         // BỘ GIẢI MÃ MẠNG CHO PROXY (TỰ ĐỘNG XỬ LÝ FORMAT RƠI RỚT CỦA CÁC ĐẦU PROXY)
         let proxyBaseUrl = activeProxy.url;
         if (proxyBaseUrl.endsWith('/')) proxyBaseUrl = proxyBaseUrl.slice(0, -1);
@@ -217,6 +222,7 @@ async function startServer() {
               model: model,
               messages: [],
               temperature: typeof temperature === 'number' ? temperature : 0.7,
+              max_tokens: 65536,
               stream: true,
               stream_options: { include_usage: true }
            };
@@ -253,175 +259,174 @@ async function startServer() {
             }
         }
         
-        try {
-           const proxyStreamRes = await fetch(targetUrl, {
-             method: 'POST',
-             headers: {
-               'Content-Type': 'application/json',
-               'Authorization': `Bearer ${activeProxy.key}`,
-               'x-goog-api-key': activeProxy.key // Fallback param
-             },
-             body: JSON.stringify(reqBody)
-           });
-           
-           if (!proxyStreamRes.ok) {
-             const errText = await proxyStreamRes.text().catch(()=>'');
-             throw new Error(`Proxy error: ${proxyStreamRes.status} - ${errText}`);
-           }
-           if (!proxyStreamRes.body) throw new Error('Proxy returned empty body');
+        let retryCount = 0;
 
-           const reader = proxyStreamRes.body.getReader();
-           const decoder = new TextDecoder("utf-8");
-           let buffer = "";
-
-           while (true) {
-             const { done, value } = await reader.read();
-             if (done) break;
-
-             buffer += decoder.decode(value, { stream: true });
+        while (!isClientDisconnected) {
+          try {
+             const proxyStreamRes = await fetch(targetUrl, {
+               method: 'POST',
+               headers: {
+                 'Content-Type': 'application/json',
+                 'Authorization': `Bearer ${activeProxy.key}`,
+                 'x-goog-api-key': activeProxy.key // Fallback param
+               },
+               body: JSON.stringify(reqBody)
+             });
              
-             let boundary = buffer.indexOf('\n');
-             while (boundary !== -1) {
-               let line = buffer.slice(0, boundary).trim();
-               buffer = buffer.slice(boundary + 1);
-               boundary = buffer.indexOf('\n');
+             if (!proxyStreamRes.ok) {
+               const errText = await proxyStreamRes.text().catch(()=>'');
+               throw new Error(`Proxy error: ${proxyStreamRes.status} - ${errText}`);
+             }
+             if (!proxyStreamRes.body) throw new Error('Proxy returned empty body');
 
-               if (line.startsWith("data: ")) {
-                 const dataStr = line.slice(6).trim();
-                 if (!dataStr) continue;
-                 if (dataStr === "[DONE]") continue; // Ignore proxy's own done
-                 try {
-                   const parsedObj = JSON.parse(dataStr);
-                   const items = Array.isArray(parsedObj) ? parsedObj : [parsedObj];
-                   
-                   for (const chunkData of items) {
+             const reader = proxyStreamRes.body.getReader();
+             const decoder = new TextDecoder("utf-8");
+             let buffer = "";
+
+             while (!isClientDisconnected) {
+               const { done, value } = await reader.read();
+               if (done) break;
+
+               buffer += decoder.decode(value, { stream: true });
+               
+               let boundary = buffer.indexOf('\n');
+               while (boundary !== -1) {
+                 let line = buffer.slice(0, boundary).trim();
+                 buffer = buffer.slice(boundary + 1);
+                 boundary = buffer.indexOf('\n');
+
+                 if (line.startsWith("data: ")) {
+                   const dataStr = line.slice(6).trim();
+                   if (!dataStr) continue;
+                   if (dataStr === "[DONE]") continue; // Ignore proxy's own done
+                   try {
+                     const parsedObj = JSON.parse(dataStr);
+                     const items = Array.isArray(parsedObj) ? parsedObj : [parsedObj];
+                     
+                     for (const chunkData of items) {
+                         let textPart = "";
+                         let thoughtPart = "";
+                         let usage = null;
+                         
+                         if (chunkData.usageMetadata || chunkData.usage) {
+                            usage = chunkData.usageMetadata || chunkData.usage;
+                         }
+                         
+                         // Gemini Format
+                         if (chunkData.candidates && chunkData.candidates[0]) {
+                            const candidate = chunkData.candidates[0];
+                            if (candidate.content && candidate.content.parts) {
+                                Object.values(candidate.content.parts).forEach((p: any) => {
+                                   if (p.text) textPart += p.text;
+                                   if (p.thought) thoughtPart += p.thought;
+                                });
+                            }
+                         } 
+                         // OpenAI Format (fallback)
+                         else if (chunkData.choices && chunkData.choices[0] && chunkData.choices[0].delta) {
+                            if (chunkData.choices[0].delta.content) {
+                               textPart += chunkData.choices[0].delta.content;
+                            }
+                            if (chunkData.choices[0].delta.reasoning_content) {
+                               thoughtPart += chunkData.choices[0].delta.reasoning_content;
+                            }
+                         }
+                         // If neither, just dump raw
+                         else if (!chunkData.usageMetadata && !chunkData.usage) {
+                            textPart = `\n[UNRECOGNIZED PROXY FORMAT]: ${JSON.stringify(chunkData)}\n`;
+                         }
+
+                         if (textPart || thoughtPart || usage) {
+                             const payload = JSON.stringify({ thought: thoughtPart, text: textPart, usage });
+                             res.write(`data: ${payload}\n\n`);
+                         }
+                     }
+                   } catch(e) {
+                     const payload = JSON.stringify({ thought: "", text: `\n[RAW PROXY CHUNK]: ${dataStr}\n`, usage: null });
+                     res.write(`data: ${payload}\n\n`);
+                   }
+                 } else {
+                    try {
+                      const rawJson = JSON.parse(line);
+                      if (rawJson.error) {
+                        throw new Error(rawJson.error.message || "Lỗi Proxy");
+                      } else if (rawJson.candidates) {
+                         let textPart = "";
+                         let thoughtPart = "";
+                         rawJson.candidates[0]?.content?.parts?.forEach((p: any) => {
+                            if (p.text) textPart += p.text;
+                            if (p.thought) thoughtPart += p.thought;
+                         });
+                         const payload = JSON.stringify({ thought: thoughtPart, text: textPart, usage: rawJson.usageMetadata || null });
+                         res.write(`data: ${payload}\n\n`);
+                      }
+                    } catch (err) {
+                      if (line.trim() && line !== "[DONE]" && line !== "]" && line !== "[") {
+                          const payload = JSON.stringify({ thought: "", text: `\n[NON-JSON RAW TEXT]: ${line}\n`, usage: null });
+                          res.write(`data: ${payload}\n\n`);
+                      }
+                    }
+                 }
+               }
+             }
+             
+             // PROCESS REMAINING BUFFER IF ANY
+             if (!isClientDisconnected && buffer.trim()) {
+                let line = buffer.trim();
+                if (line.startsWith("data: ")) {
+                   const dataStr = line.slice(6).trim();
+                   if (dataStr && dataStr !== "[DONE]") {
+                     try {
+                       const chunkData = JSON.parse(dataStr);
                        let textPart = "";
                        let thoughtPart = "";
                        let usage = null;
-                       
                        if (chunkData.usageMetadata || chunkData.usage) {
                           usage = chunkData.usageMetadata || chunkData.usage;
                        }
-                       
-                       // Gemini Format
-                       if (chunkData.candidates && chunkData.candidates[0]) {
-                          const candidate = chunkData.candidates[0];
-                          if (candidate.content && candidate.content.parts) {
-                              candidate.content.parts.forEach((p: any) => {
-                                 if (p.text) textPart += p.text;
-                                 if (p.thought) thoughtPart += p.thought;
-                              });
-                          }
-                       } 
-                       // OpenAI Format (fallback)
-                       else if (chunkData.choices && chunkData.choices[0] && chunkData.choices[0].delta) {
-                          if (chunkData.choices[0].delta.content) {
-                             textPart += chunkData.choices[0].delta.content;
-                          }
-                          if (chunkData.choices[0].delta.reasoning_content) {
-                             thoughtPart += chunkData.choices[0].delta.reasoning_content;
-                          }
+                       if (chunkData.candidates && chunkData.candidates[0]?.content?.parts) {
+                          chunkData.candidates[0].content.parts.forEach((p: any) => {
+                             if (p.text) textPart += p.text;
+                             if (p.thought) thoughtPart += p.thought;
+                          });
                        }
-                       // If neither, just dump raw
-                       else if (!chunkData.usageMetadata && !chunkData.usage) {
-                          textPart = `\n[UNRECOGNIZED PROXY FORMAT]: ${JSON.stringify(chunkData)}\n`;
-                       }
-
-                       if (textPart || thoughtPart || usage) {
-                           const payload = JSON.stringify({ thought: thoughtPart, text: textPart, usage });
-                           res.write(`data: ${payload}\n\n`);
-                       }
-                   }
-                 } catch(e) {
-                   const payload = JSON.stringify({ thought: "", text: `\n[RAW PROXY CHUNK]: ${dataStr}\n`, usage: null });
-                   res.write(`data: ${payload}\n\n`);
-                 }
-               } else {
-                  try {
-                    const rawJson = JSON.parse(line);
-                    if (rawJson.error) {
-                      throw new Error(rawJson.error.message || "Lỗi Proxy");
-                    } else if (rawJson.candidates) {
-                       let textPart = "";
-                       let thoughtPart = "";
-                       rawJson.candidates[0]?.content?.parts?.forEach((p: any) => {
-                          if (p.text) textPart += p.text;
-                          if (p.thought) thoughtPart += p.thought;
-                       });
-                       const payload = JSON.stringify({ thought: thoughtPart, text: textPart, usage: rawJson.usageMetadata || null });
+                       const payload = JSON.stringify({ thought: thoughtPart, text: textPart, usage });
                        res.write(`data: ${payload}\n\n`);
-                    } else {
-                        // Trả về thẳng text nếu json không đúng format Gemini
-                        const payload = JSON.stringify({ thought: "", text: `\n[UNRECOGNIZED JSON]: ${line}\n`, usage: null });
-                        res.write(`data: ${payload}\n\n`);
-                    }
-                  } catch (err) {
-                    // Nếu không parse được JSON và không phải data:
-                    if (line.trim() && line !== "[DONE]" && line !== "]" && line !== "[") {
-                        const payload = JSON.stringify({ thought: "", text: `\n[NON-JSON RAW TEXT]: ${line}\n`, usage: null });
-                        res.write(`data: ${payload}\n\n`);
-                    }
-                  }
-               }
+                     } catch(e) { }
+                   }
+                } else if (line.startsWith("{")) {
+                    try {
+                      const rawJson = JSON.parse(line);
+                      if (rawJson.error) {
+                        throw new Error(rawJson.error.message || "Lỗi Proxy");
+                      } else if (rawJson.candidates) {
+                         let textPart = "";
+                         let thoughtPart = "";
+                         rawJson.candidates[0]?.content?.parts?.forEach((p: any) => {
+                            if (p.text) textPart += p.text;
+                            if (p.thought) thoughtPart += p.thought;
+                         });
+                         const payload = JSON.stringify({ thought: thoughtPart, text: textPart, usage: rawJson.usageMetadata || null });
+                         res.write(`data: ${payload}\n\n`);
+                      }
+                    } catch (err) { }
+                }
              }
-           }
-           
-           // PROCESS REMAINING BUFFER IF ANY
-           if (buffer.trim()) {
-              let line = buffer.trim();
-              if (line.startsWith("data: ")) {
-                 const dataStr = line.slice(6).trim();
-                 if (dataStr && dataStr !== "[DONE]") {
-                   try {
-                     const chunkData = JSON.parse(dataStr);
-                     let textPart = "";
-                     let thoughtPart = "";
-                     let usage = null;
-                     if (chunkData.usageMetadata || chunkData.usage) {
-                        usage = chunkData.usageMetadata || chunkData.usage;
-                     }
-                     if (chunkData.candidates && chunkData.candidates[0]?.content?.parts) {
-                        chunkData.candidates[0].content.parts.forEach((p: any) => {
-                           if (p.text) textPart += p.text;
-                           if (p.thought) thoughtPart += p.thought;
-                        });
-                     }
-                     const payload = JSON.stringify({ thought: thoughtPart, text: textPart, usage });
-                     res.write(`data: ${payload}\n\n`);
-                   } catch(e) {
-                     const payload = JSON.stringify({ thought: "", text: `\n[RAW PROXY REMAINING CHUNK]: ${dataStr}\n`, usage: null });
-                     res.write(`data: ${payload}\n\n`);
-                   }
-                 }
-              } else if (line.startsWith("{")) {
-                  try {
-                    const rawJson = JSON.parse(line);
-                    if (rawJson.error) {
-                      throw new Error(rawJson.error.message || "Lỗi Proxy");
-                    } else if (rawJson.candidates) {
-                       let textPart = "";
-                       let thoughtPart = "";
-                       rawJson.candidates[0]?.content?.parts?.forEach((p: any) => {
-                          if (p.text) textPart += p.text;
-                          if (p.thought) thoughtPart += p.thought;
-                       });
-                       const payload = JSON.stringify({ thought: thoughtPart, text: textPart, usage: rawJson.usageMetadata || null });
-                       res.write(`data: ${payload}\n\n`);
-                    } else {
-                       const payload = JSON.stringify({ thought: "", text: `\n[UNRECOGNIZED REMAINING JSON]: ${line}\n`, usage: null });
-                       res.write(`data: ${payload}\n\n`);
-                    }
-                  } catch (err) {
-                    if (line.trim() && line !== "[DONE]" && line !== "]" && line !== "[") {
-                       const payload = JSON.stringify({ thought: "", text: `\n[NON-JSON RAW REMAINING TEXT]: ${line}\n`, usage: null });
-                       res.write(`data: ${payload}\n\n`);
-                    }
-                  }
-              }
-           }
-        } catch (err: any) {
-           console.error("Lỗi Bộ giải mã Proxy:", err);
-           res.write(`event: error\ndata: ${JSON.stringify({ error: err.message || "Lỗi Proxy" })}\n\n`);
+
+             // If loop exits gracefully without error, break infinite retry
+             break;
+          } catch (err: any) {
+             if (isClientDisconnected) break;
+             retryCount++;
+             const retryMsg = JSON.stringify({ 
+                 thought: `\n[HỆ THỐNG] Lỗi Proxy: ${err.message}. Đang tự động thử lại sau 1.5s rảnh tay (Lần ${retryCount})...\n`, 
+                 text: "", 
+                 usage: null 
+             });
+             res.write(`data: ${retryMsg}\n\n`);
+             // Chờ 1.5s trước khi thử lại
+             await new Promise(resolve => setTimeout(resolve, 1500));
+          }
         }
   }
 
@@ -450,7 +455,7 @@ async function startServer() {
             // Cấu trúc riêng cho dòng Flash
             config = {
                ...config,
-               maxOutputTokens: 8192, // Các dòng flash thường hỗ trợ output token ít hơn hoặc muốn tốc độ nhanh nhất
+               maxOutputTokens: 65536, // Các dòng flash thường hỗ trợ output token ít hơn hoặc muốn tốc độ nhanh nhất
             };
           }
 

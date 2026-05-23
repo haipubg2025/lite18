@@ -378,119 +378,139 @@ class AIService {
       }
     }
 
-    const response = await fetch(targetUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(reqBody)
-    });
-
-    if (!response.ok) {
-      if (providedApiKey && !isUsingProxy) {
-        console.warn(`[AI Service] API Key lỗi (Direct), thêm vào blacklist: ${providedApiKey.substring(0, 8)}...`);
-        this.apiKeysBlacklist.add(providedApiKey);
-      }
-      const errText = await response.text().catch(() => "");
-      throw new Error(`Lỗi kết nối trực tiếp (${response.status}): ${errText || response.statusText}`);
-    }
-
-    if (!response.body) {
-      throw new Error("Không có luồng dữ liệu trả về từ máy chủ AI.");
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder("utf-8");
-    let buffer = "";
+    let retryCount = 0;
 
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      try {
+        const response = await fetch(targetUrl, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(reqBody)
+        });
 
-      buffer += decoder.decode(value, { stream: true });
-      let boundary = buffer.indexOf('\n');
+        if (!response.ok) {
+          if (providedApiKey && !isUsingProxy) {
+            console.warn(`[AI Service] API Key lỗi (Direct), thêm vào blacklist: ${providedApiKey.substring(0, 8)}...`);
+            this.apiKeysBlacklist.add(providedApiKey);
+          }
+          const errText = await response.text().catch(() => "");
+          throw new Error(`Lỗi kết nối trực tiếp (${response.status}): ${errText || response.statusText}`);
+        }
 
-      while (boundary !== -1) {
-        let line = buffer.slice(0, boundary).trim();
-        buffer = buffer.slice(boundary + 1);
-        boundary = buffer.indexOf('\n');
+        if (!response.body) {
+          throw new Error("Không có luồng dữ liệu trả về từ máy chủ AI.");
+        }
 
-        if (line.startsWith("data: ")) {
-          const dataStr = line.slice(6).trim();
-          if (!dataStr || dataStr === "[DONE]") continue;
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
 
-          try {
-            const parsedObj = JSON.parse(dataStr);
-            const items = Array.isArray(parsedObj) ? parsedObj : [parsedObj];
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-            for (const chunkData of items) {
-              let textPart = "";
-              let thoughtPart = "";
-              let usage = chunkData.usageMetadata || chunkData.usage || null;
+          buffer += decoder.decode(value, { stream: true });
+          let boundary = buffer.indexOf('\n');
 
-              // Định dạng Gemini chính thức
-              if (chunkData.candidates && chunkData.candidates[0]) {
-                const candidate = chunkData.candidates[0];
-                if (candidate.content && candidate.content.parts) {
-                  candidate.content.parts.forEach((p: any) => {
-                    if (p.text) textPart += p.text;
-                    if (p.thought) thoughtPart += p.thought;
-                  });
+          while (boundary !== -1) {
+            let line = buffer.slice(0, boundary).trim();
+            buffer = buffer.slice(boundary + 1);
+            boundary = buffer.indexOf('\n');
+
+            if (line.startsWith("data: ")) {
+              const dataStr = line.slice(6).trim();
+              if (!dataStr || dataStr === "[DONE]") continue;
+
+              try {
+                const parsedObj = JSON.parse(dataStr);
+                const items = Array.isArray(parsedObj) ? parsedObj : [parsedObj];
+
+                for (const chunkData of items) {
+                  let textPart = "";
+                  let thoughtPart = "";
+                  let usage = chunkData.usageMetadata || chunkData.usage || null;
+
+                  // Định dạng Gemini chính thức
+                  if (chunkData.candidates && chunkData.candidates[0]) {
+                    const candidate = chunkData.candidates[0];
+                    if (candidate.content && candidate.content.parts) {
+                      candidate.content.parts.forEach((p: any) => {
+                        if (p.text) textPart += p.text;
+                        if (p.thought) thoughtPart += p.thought;
+                      });
+                    }
+                  }
+                  // Định dạng OpenAI
+                  else if (chunkData.choices && chunkData.choices[0] && chunkData.choices[0].delta) {
+                    const delta = chunkData.choices[0].delta;
+                    if (delta.content) textPart += delta.content;
+                    if (delta.reasoning_content) thoughtPart += delta.reasoning_content;
+                  }
+
+                  if (textPart || thoughtPart || usage) {
+                    yield { thought: thoughtPart, text: textPart, usage };
+                  }
+                }
+              } catch (e) {
+                // Thử hiển thị text thô nếu không parse được json
+              }
+            }
+          }
+        }
+
+        // XỬ LÝ KHỐI BUFFER CUỐI CÙNG (Thường chứa usageMetadata ở chunk cuối từ SSE API)
+        if (buffer.trim()) {
+          let line = buffer.trim();
+          if (line.startsWith("data: ")) {
+            line = line.slice(6).trim();
+          }
+          if (line && line !== "[DONE]") {
+            try {
+              const parsedObj = JSON.parse(line);
+              const items = Array.isArray(parsedObj) ? parsedObj : [parsedObj];
+              
+              for (const chunkData of items) {
+                let textPart = "";
+                let thoughtPart = "";
+                let usage = chunkData.usageMetadata || chunkData.usage || null;
+
+                if (chunkData.candidates && chunkData.candidates[0]) {
+                  const candidate = chunkData.candidates[0];
+                  if (candidate.content && candidate.content.parts) {
+                    candidate.content.parts.forEach((p: any) => {
+                      if (p.text) textPart += p.text;
+                      if (p.thought) thoughtPart += p.thought;
+                    });
+                  }
+                } else if (chunkData.choices && chunkData.choices[0] && chunkData.choices[0].delta) {
+                  const delta = chunkData.choices[0].delta;
+                  if (delta.content) textPart += delta.content;
+                  if (delta.reasoning_content) thoughtPart += delta.reasoning_content;
+                }
+
+                if (textPart || thoughtPart || usage) {
+                  yield { thought: thoughtPart, text: textPart, usage };
                 }
               }
-              // Định dạng OpenAI
-              else if (chunkData.choices && chunkData.choices[0] && chunkData.choices[0].delta) {
-                const delta = chunkData.choices[0].delta;
-                if (delta.content) textPart += delta.content;
-                if (delta.reasoning_content) thoughtPart += delta.reasoning_content;
-              }
-
-              if (textPart || thoughtPart || usage) {
-                yield { thought: thoughtPart, text: textPart, usage };
-              }
-            }
-          } catch (e) {
-            // Thử hiển thị text thô nếu không parse được json
-          }
-        }
-      }
-    }
-
-    // XỬ LÝ KHỐI BUFFER CUỐI CÙNG (Thường chứa usageMetadata ở chunk cuối từ SSE API)
-    if (buffer.trim()) {
-      let line = buffer.trim();
-      if (line.startsWith("data: ")) {
-        line = line.slice(6).trim();
-      }
-      if (line && line !== "[DONE]") {
-        try {
-          const parsedObj = JSON.parse(line);
-          const items = Array.isArray(parsedObj) ? parsedObj : [parsedObj];
-          
-          for (const chunkData of items) {
-            let textPart = "";
-            let thoughtPart = "";
-            let usage = chunkData.usageMetadata || chunkData.usage || null;
-
-            if (chunkData.candidates && chunkData.candidates[0]) {
-              const candidate = chunkData.candidates[0];
-              if (candidate.content && candidate.content.parts) {
-                candidate.content.parts.forEach((p: any) => {
-                  if (p.text) textPart += p.text;
-                  if (p.thought) thoughtPart += p.thought;
-                });
-              }
-            } else if (chunkData.choices && chunkData.choices[0] && chunkData.choices[0].delta) {
-              const delta = chunkData.choices[0].delta;
-              if (delta.content) textPart += delta.content;
-              if (delta.reasoning_content) thoughtPart += delta.reasoning_content;
-            }
-
-            if (textPart || thoughtPart || usage) {
-              yield { thought: thoughtPart, text: textPart, usage };
+            } catch (e) {
+              // Bỏ qua lỗi chunk thừa
             }
           }
-        } catch (e) {
-          // Bỏ qua lỗi chunk thừa
         }
+
+        // Nếu mọi thứ ok break khỏi loop retry
+        break;
+      } catch (error: any) {
+        if (!isUsingProxy) {
+          throw error;
+        }
+        retryCount++;
+         yield {
+           thought: `\n[HỆ THỐNG] Lỗi gọi Proxy trực tiếp: ${error.message}. Đang tự động thử lại sau 1.5 giây (Lần ${retryCount})...\n`,
+           text: "",
+           usage: null
+        };
+        await new Promise(resolve => setTimeout(resolve, 1500));
       }
     }
 
